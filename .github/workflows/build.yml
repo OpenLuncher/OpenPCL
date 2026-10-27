@@ -1,0 +1,170 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.configuration }}${{ matrix.unrestricted && ' (Unrestricted)' || '' }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: Release
+            unrestricted: false
+            asset: 'Plain Craft Launcher 2.exe'
+          - configuration: Release
+            unrestricted: true
+            asset: 'Plain Craft Launcher 2 Unrestricted.exe'
+          - configuration: Debug
+            unrestricted: false
+            asset: 'Plain Craft Launcher 2 Debug.exe'
+          - configuration: Debug
+            unrestricted: true
+            asset: 'Plain Craft Launcher 2 Unrestricted Debug.exe'
+          - configuration: Snapshot
+            unrestricted: false
+            asset: 'Plain Craft Launcher 2 Snapshot.exe'
+          - configuration: Snapshot
+            unrestricted: true
+            asset: 'Plain Craft Launcher 2 Unrestricted Snapshot.exe'
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 1
+        submodules: true
+
+    - name: Setup MSBuild.exe
+      uses: microsoft/setup-msbuild@v3
+      with:
+        msbuild-architecture: x64
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+
+    # Help.zip 拉取失败不应阻断编译（仓库里本身有一份）
+    - name: Update Help
+      shell: pwsh
+      continue-on-error: true
+      run: |
+        $dst = Join-Path $env:RUNNER_TEMP 'PCL2Help'
+        git clone https://github.com/LTCatt/PCL2Help.git -b master --single-branch --depth 1 $dst
+        Remove-Item (Join-Path $dst '.git') -Recurse -Force
+        Compress-Archive -Path (Join-Path $dst '*') -DestinationPath 'Plain Craft Launcher 2\Resources\Help.zip' -Force
+        Remove-Item $dst -Recurse -Force
+
+    - name: Set Commit Hash
+      shell: pwsh
+      run: |
+        $p = Join-Path $env:GITHUB_WORKSPACE 'Plain Craft Launcher 2\Modules\Base\ModBase.vb'
+        $t = [System.IO.File]::ReadAllText($p)
+        $t = $t -replace 'Public Const CommitHash As String = ""', 'Public Const CommitHash As String = "${{ github.sha }}"'
+        [System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($false)))
+
+    # 解锁下载版：RestrictMcDownload = False
+    - name: Set RestrictMcDownload
+      if: matrix.unrestricted
+      shell: pwsh
+      run: |
+        $p = Join-Path $env:GITHUB_WORKSPACE 'Plain Craft Launcher 2\Modules\ModSecret.vb'
+        $t = [System.IO.File]::ReadAllText($p)
+        $t2 = $t -replace 'Public Const RestrictMcDownload As Boolean = True', 'Public Const RestrictMcDownload As Boolean = False'
+        if ($t2 -eq $t) { throw 'RestrictMcDownload = True 未找到' }
+        [System.IO.File]::WriteAllText($p, $t2, (New-Object System.Text.UTF8Encoding($false)))
+
+    # ---------------------------------------------------------------------
+    # 1) SDK 风格依赖：MeloongCore / MeloongCore.Wpf / PCLCS
+    #    产物必须落在 PCLCS\bin\，Resources.resx 会用 ResXFileRef 把它们
+    #    嵌进主 exe（运行期由 Application.xaml.vb 的 AssemblyResolve 加载）
+    # ---------------------------------------------------------------------
+    - name: Build Dependencies
+      shell: pwsh
+      run: |
+        dotnet build PCLCS\PCLCS.csproj -c ${{ matrix.configuration }} -v:m
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    # ---------------------------------------------------------------------
+    # 2) 生成临时主工程：把 ProjectReference 换成 Reference/HintPath。
+    #    直接编原 vbproj 会因 VS 的 MSBuild 找不到 Microsoft.NET.Sdk 而报
+    #    MSB4236（SDK 风格子工程无法被解析）。
+    # ---------------------------------------------------------------------
+    - name: Generate Build Project
+      shell: pwsh
+      run: |
+        $src = Join-Path $env:GITHUB_WORKSPACE 'Plain Craft Launcher 2\Plain Craft Launcher 2.vbproj'
+        $dst = Join-Path $env:GITHUB_WORKSPACE 'Plain Craft Launcher 2\_build_only.vbproj'
+        $text = [System.IO.File]::ReadAllText($src)
+        $i = $text.IndexOf('<ProjectReference ')
+        if ($i -lt 0) { throw 'ProjectReference 未找到' }
+        $groupStart = $text.LastIndexOf('<ItemGroup>', $i)
+        $lastRef = $text.LastIndexOf('</ProjectReference>')
+        $groupEnd = $text.IndexOf('</ItemGroup>', $lastRef) + '</ItemGroup>'.Length
+        $block = @(
+          '  <ItemGroup>',
+          '    <Reference Include="MeloongCore">',
+          '      <HintPath>..\PCLCS\bin\MeloongCore.dll</HintPath>',
+          '      <Private>False</Private>',
+          '    </Reference>',
+          '    <Reference Include="MeloongCore.Wpf">',
+          '      <HintPath>..\PCLCS\bin\MeloongCore.Wpf.dll</HintPath>',
+          '      <Private>False</Private>',
+          '    </Reference>',
+          '    <Reference Include="PCLCS">',
+          '      <HintPath>..\PCLCS\bin\PCLCS.dll</HintPath>',
+          '    </Reference>',
+          '  </ItemGroup>'
+        ) -join "`n"
+        $out = $text.Substring(0, $groupStart) + $block + $text.Substring($groupEnd)
+        [System.IO.File]::WriteAllText($dst, $out, (New-Object System.Text.UTF8Encoding($true)))
+
+    - name: Build
+      run: msbuild "Plain Craft Launcher 2\_build_only.vbproj" -p:Configuration=${{ matrix.configuration }} -v:m
+
+    - name: Stage Asset
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path out | Out-Null
+        Copy-Item 'Plain Craft Launcher 2\bin\Plain Craft Launcher 2.exe' "out\${{ matrix.asset }}" -Force
+        Get-Item "out\${{ matrix.asset }}" | Format-List Name,Length
+
+    - name: Upload a Build Artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.asset }}
+        path: out/${{ matrix.asset }}
+        if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List Assets
+        run: ls -l dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
